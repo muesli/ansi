@@ -20,6 +20,8 @@ w.Close()
 
 ## Compressor
 
+The ANSI compressor eliminates unnecessary/redundant ANSI sequences.
+
 ```go
 import "github.com/muesli/ansi/compressor"
 
