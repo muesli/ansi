@@ -14,12 +14,30 @@ type Writer struct {
 	lastseq    bytes.Buffer
 	seqchanged bool
 	runeBuf    []byte
+	err        error
 }
 
 // Write is used to write content to the ANSI buffer.
+// If buffered escape or style state exceeds MaxSequenceSize, Write returns
+// ErrSequenceTooLong. Subsequent writes return the same error.
 func (w *Writer) Write(b []byte) (int, error) {
-	for _, c := range string(b) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	sequenceStart := -w.ansiseq.Len()
+	for i, c := range string(b) {
+		if (c == Marker || w.ansi) && w.ansiseq.Len()+utf8.RuneLen(c) > MaxSequenceSize {
+			w.err = ErrSequenceTooLong
+			written := sequenceStart
+			if written < 0 {
+				written = 0
+			}
+			return written, w.err
+		}
 		if c == Marker {
+			if w.ansiseq.Len() == 0 {
+				sequenceStart = i
+			}
 			// ANSI escape sequence
 			w.ansi = true
 			w.seqchanged = true
@@ -36,6 +54,14 @@ func (w *Writer) Write(b []byte) (int, error) {
 					w.seqchanged = false
 				} else if c == 'm' {
 					// color code
+					if w.lastseq.Len()+w.ansiseq.Len() > MaxSequenceSize {
+						w.err = ErrSequenceTooLong
+						written := sequenceStart
+						if written < 0 {
+							written = 0
+						}
+						return written, w.err
+					}
 					_, _ = w.lastseq.Write(w.ansiseq.Bytes())
 				}
 
