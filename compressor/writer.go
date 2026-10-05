@@ -16,9 +16,9 @@ type Writer struct {
 	lastseq      bytes.Buffer
 	prevlastseq  bytes.Buffer
 	resetreq     bool
-	runeBuf      []byte
 	compressed   int
 	uncompressed int
+	err          error
 }
 
 // Bytes is shorthand for declaring a new default compressor instance,
@@ -41,16 +41,26 @@ func String(s string) string {
 }
 
 // Write is used to write content to the ANSI buffer.
+// A forwarding error is retained; subsequent writes return the same error.
 func (w *Writer) Write(b []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
 	w.uncompressed += len(b)
+	sequenceStart := -w.ansiseq.Len()
 
-	for _, c := range string(b) {
+	for i, c := range string(b) {
+		_, size := utf8.DecodeRune(b[i:])
+		chunk := b[i : i+size]
 		if c == ansi.Marker {
 			// ANSI escape sequence
+			if w.ansiseq.Len() == 0 {
+				sequenceStart = i
+			}
 			w.ansi = true
-			_, _ = w.ansiseq.WriteRune(c)
+			_, _ = w.ansiseq.Write(chunk)
 		} else if w.ansi {
-			_, _ = w.ansiseq.WriteRune(c)
+			_, _ = w.ansiseq.Write(chunk)
 			if ansi.IsTerminator(c) {
 				// ANSI sequence terminated
 				w.ansi = false
@@ -79,23 +89,45 @@ func (w *Writer) Write(b []byte) (int, error) {
 					w.prevlastseq.Reset()
 
 					if w.resetreq {
-						w.ResetAnsi()
+						if err := w.resetAnsi(); err != nil {
+							w.err = err
+							written := sequenceStart
+							if written < 0 {
+								written = 0
+							}
+							return written, err
+						}
 					}
 
-					_, _ = w.Forward.Write(w.ansiseq.Bytes())
-					w.compressed += w.ansiseq.Len()
+					n, err := w.Forward.Write(w.ansiseq.Bytes())
+					w.compressed += n
+					if err == nil && n < w.ansiseq.Len() {
+						err = io.ErrShortWrite
+					}
+					if err != nil {
+						w.err = err
+						written := sequenceStart + n
+						if written < 0 {
+							written = 0
+						}
+						return written, err
+					}
 				}
 
 				w.ansiseq.Reset()
 			}
 		} else {
 			if w.resetreq {
-				w.ResetAnsi()
+				if err := w.resetAnsi(); err != nil {
+					w.err = err
+					return i, err
+				}
 			}
 
-			_, err := w.writeRune(c)
+			n, err := w.writeBytes(chunk)
 			if err != nil {
-				return 0, err
+				w.err = err
+				return i + n, err
 			}
 		}
 	}
@@ -103,20 +135,26 @@ func (w *Writer) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (w *Writer) writeRune(r rune) (int, error) {
-	if w.runeBuf == nil {
-		w.runeBuf = make([]byte, utf8.UTFMax)
+func (w *Writer) writeBytes(b []byte) (int, error) {
+	written, err := w.Forward.Write(b)
+	w.compressed += written
+	if err == nil && written < len(b) {
+		err = io.ErrShortWrite
 	}
-	n := utf8.EncodeRune(w.runeBuf, r)
-	w.compressed += n
-	return w.Forward.Write(w.runeBuf[:n])
+	return written, err
 }
 
 // Close finishes the compression operation. Always call it before trying to
 // retrieve the final result.
 func (w *Writer) Close() error {
+	if w.err != nil {
+		return w.err
+	}
 	if w.resetreq {
-		w.ResetAnsi()
+		if err := w.resetAnsi(); err != nil {
+			w.err = err
+			return err
+		}
 	}
 
 	// log.Println("Written uncompressed: ", w.uncompressed)
@@ -126,7 +164,20 @@ func (w *Writer) Close() error {
 }
 
 func (w *Writer) ResetAnsi() {
+	if w.err == nil {
+		w.err = w.resetAnsi()
+	}
+}
+
+func (w *Writer) resetAnsi() error {
+	n, err := w.Forward.Write([]byte("\x1b[0m"))
+	if err != nil {
+		return err
+	}
+	if n < len("\x1b[0m") {
+		return io.ErrShortWrite
+	}
 	w.prevlastseq.Reset()
-	_, _ = w.Forward.Write([]byte("\x1b[0m"))
 	w.resetreq = false
+	return nil
 }
